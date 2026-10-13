@@ -496,13 +496,32 @@
             '';
           };
 
+          # tests/fixtures/depsvc, the one compiled core-module fixture, built
+          # ONCE. Two consumers draw on it: `depsvc-lgx` below (the .lgx the
+          # dependency-gate doc-test installs) and the installed trees the UI
+          # suite seeds into its user dir. PMU's builder: already locked, and
+          # its mingw Qt is the bundle's.
+          depsvcModule =
+            let builder = logos-package-manager-ui.inputs.logos-module-builder; in
+            (builder.lib.mkLogosModule {
+              src = ./tests/fixtures/depsvc;
+              configFile = ./tests/fixtures/depsvc/metadata.json;
+              flakeInputs = { logos-module-builder = builder; };
+            }).packages.${system};
+          depsvcInstalledDev = installDev depsvcModule.default;
+          depsvcInstalledPortable = installPortable depsvcModule.default;
+
           # Hoisted so shutdown-test can read the elapsed time for the combined PR-gate budget.
-          integrationTest = import ./nix/integration-test.nix { inherit pkgs src logosQtMcp; appPkg = app; };
+          integrationTest = import ./nix/integration-test.nix {
+            inherit pkgs src logosQtMcp; appPkg = app;
+            seedModules = [ depsvcInstalledDev ];
+          };
           integrationTestBundle = import ./nix/integration-test.nix {
             inherit pkgs src;
             appPkg = macosAppTest;
             inherit logosQtMcp;
             appBin = "${macosAppTest}/LogosBasecamp.app/Contents/MacOS/LogosBasecamp";
+            seedModules = [ depsvcInstalledPortable ];
           };
         in
         {
@@ -569,15 +588,9 @@
           intents-fixtures = buildPkgs.runCommandLocal "basecamp-intents-fixtures" { } ''
             cp -r ${./tests/fixtures/intents} $out
           '';
-          # basecamp-dependency-gate: the module that spec writes out, as an .lgx.
-          # PMU's builder: already locked, and its mingw Qt is the bundle's.
-          depsvc-lgx =
-            let builder = logos-package-manager-ui.inputs.logos-module-builder; in
-            (builder.lib.mkLogosModule {
-              src = ./tests/fixtures/depsvc;
-              configFile = ./tests/fixtures/depsvc/metadata.json;
-              flakeInputs = { logos-module-builder = builder; };
-            }).packages.${system}.lgx-portable;
+          # basecamp-dependency-gate: the module that spec writes out, as an .lgx
+          # (same build as the UI suite's seeded depsvc, see depsvcModule).
+          depsvc-lgx = depsvcModule.lgx-portable;
 
           # Standalone mode end to end (`--module`), through mkPluginTest: a
           # QML-only app that calls a core dependency through the bridge, and
@@ -757,6 +770,7 @@
             appPkg = macosAppTest;
             inherit logosQtMcp;
             appBin = "${macosAppTest}/LogosBasecamp.app/Contents/MacOS/LogosBasecamp";
+            seedModules = [ depsvcInstalledPortable ];
           };
           host-services-test-bundle = import ./nix/host-services-test.nix {
             inherit pkgs src;
