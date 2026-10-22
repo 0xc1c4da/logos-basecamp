@@ -3160,6 +3160,49 @@ test("repositories: whitespace is rejected, duplicate URL is a no-op", async (ap
   }, { timeout: 5000, interval: 250, description: "Add button to disable again" });
 });
 
+// --- Repositories (A27) — refresh flips the button label -------------------
+//
+// Text and enabled follow backend.repositoriesLoading (RepositoriesView.qml).
+// The loading window is one in-process IPC round trip, too short to poll for
+// after the click returns, so the click and the sample share one evaluate:
+// the counter rises synchronously and only the event loop can lower it.
+test("repositories: refresh flips the button label", async (app) => {
+  const anchorId = await openRepositoriesView(app);
+  const refreshButton = await requireObject(app, "repositories.refreshButton");
+  const reposLoading = () => evalOn(app, anchorId, "backend.repositoriesLoading");
+  const buttonText = () => evalOn(app, refreshButton.id, "text");
+  const buttonEnabled = () => evalOn(app, refreshButton.id, "enabled");
+
+  // Opening the view schedules a refresh; let it settle first.
+  await app.waitFor(async () => {
+    assertEq(await reposLoading(), false, "backend.repositoriesLoading");
+    assertEq(await buttonEnabled(), true, "refresh button enabled");
+    assertEq(await buttonText(), "Refresh", "refresh button text");
+  }, { timeout: 30000, interval: 500, description: "no refresh to be in flight before the click" });
+  const preCount = assertType(
+    await evalOn(app, anchorId, "backend.repositories.length"),
+    "number", "backend.repositories.length");
+
+  const inFlight = JSON.parse(await evalOn(app, refreshButton.id, `(function () {
+    clicked();
+    return JSON.stringify({ text: text, enabled: enabled, loading: backend.repositoriesLoading });
+  })()`));
+  // "Refreshing…" is a single U+2026, as in the QML.
+  assertEq(inFlight.text, "Refreshing…", "refresh button text in the same evaluation as the click");
+  assertEq(inFlight.enabled, false, "refresh button enabled in the same evaluation as the click");
+  assertEq(inFlight.loading, true, "backend.repositoriesLoading in the same evaluation as the click");
+
+  await app.waitFor(async () => {
+    assertEq(await buttonText(), "Refresh", "refresh button text after refresh");
+    assertEq(await buttonEnabled(), true, "refresh button enabled after refresh");
+    assertEq(await reposLoading(), false, "backend.repositoriesLoading after refresh");
+  }, { timeout: 30000, interval: 250, description: "refresh to settle" });
+
+  // Single read: a retried wait would mask a transient drop.
+  assertEq(await evalOn(app, anchorId, "backend.repositories.length"), preCount,
+           "backend.repositories.length after the refresh settled");
+});
+
 test("repositories: disabling default keeps it in the list", async (app) => {
   const anchorId = await openRepositoriesView(app);
 
