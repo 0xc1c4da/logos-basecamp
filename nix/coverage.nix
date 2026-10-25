@@ -50,6 +50,8 @@ pkgs.stdenv.mkDerivation {
     # error naming the test, not a skip.
     pkgs.spdlog
     pkgs.yaml-cpp
+  ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+    pkgs.qt6.qtwayland     # view_surface_test (see nix/unit-tests.nix)
   ];
 
   dontUseCmakeConfigure = true;
@@ -73,8 +75,9 @@ pkgs.stdenv.mkDerivation {
   checkPhase = ''
     runHook preCheck
     export QT_QPA_PLATFORM=offscreen
+    export HOME="$TMPDIR/home"; mkdir -p "$HOME"
     ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-      export QT_PLUGIN_PATH="${pkgs.qt6.qtbase}/${pkgs.qt6.qtbase.qtPluginPrefix}"
+      export QT_PLUGIN_PATH="${pkgs.qt6.qtbase}/${pkgs.qt6.qtbase.qtPluginPrefix}:${pkgs.qt6.qtwayland}/${pkgs.qt6.qtbase.qtPluginPrefix}"
     ''}
     ctest --test-dir build-cov --output-on-failure
     runHook postCheck

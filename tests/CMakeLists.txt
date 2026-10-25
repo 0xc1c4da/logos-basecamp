@@ -14,6 +14,16 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network Qml Test Widgets Quick QuickWi
 find_package(spdlog QUIET)
 find_package(yaml-cpp QUIET)
 
+# view_surface_test drives the nested compositor (app/surface/*, RFC-4) with a
+# real Wayland client; it exists only where Qt6::WaylandCompositor does.
+set(LOGOS_HAVE_WAYLAND_COMPOSITOR OFF)
+if(UNIX AND NOT APPLE)
+    find_package(Qt6 COMPONENTS WaylandCompositor QUIET)
+    if(TARGET Qt6::WaylandCompositor)
+        set(LOGOS_HAVE_WAYLAND_COMPOSITOR ON)
+    endif()
+endif()
+
 enable_testing()
 
 # Two source roots: the host in ../app, the main_ui shell in ../src. The unit
@@ -47,6 +57,10 @@ endif()
 # -----------------------------------------------------------------------
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp")
+if(NOT LOGOS_HAVE_WAYLAND_COMPOSITOR)
+    list(FILTER TEST_SOURCES EXCLUDE REGEX "view_surface_test\\.cpp$")
+    message(STATUS "Qt6::WaylandCompositor not available: skipping view_surface_test")
+endif()
 
 foreach(test_src IN LISTS TEST_SOURCES)
     get_filename_component(test_name "${test_src}" NAME_WE)
@@ -114,5 +128,8 @@ foreach(test_src IN LISTS TEST_SOURCES)
         Qt6::Test
         ${_extra_libs}
     )
+    if(LOGOS_HAVE_WAYLAND_COMPOSITOR)
+        target_compile_definitions(${test_name} PRIVATE LOGOS_HAVE_WAYLAND_COMPOSITOR)
+    endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

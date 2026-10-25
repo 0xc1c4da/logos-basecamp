@@ -24,6 +24,17 @@ endif()
 
 find_package(Qt6 COMPONENTS Widgets RemoteObjects Quick Qml QuickWidgets QuickControls2 Network REQUIRED)
 
+# The nested Wayland compositor that shows a view_surface module's backend
+# inside the host (app/surface/SurfaceCompositor.*, RFC-4). Linux only: the
+# compositor is a Wayland server, which is a Linux thing regardless of which
+# QPA the host itself runs on. Elsewhere Logos.Surface still exists as a QML
+# type and reports `transport: "none"`.
+set(LOGOS_HAVE_WAYLAND_COMPOSITOR OFF)
+if(UNIX AND NOT APPLE)
+    find_package(Qt6 COMPONENTS WaylandCompositor REQUIRED)
+    set(LOGOS_HAVE_WAYLAND_COMPOSITOR ON)
+endif()
+
 # The session log sink and its YAML configuration (app/utils/LogSink.*,
 # app/utils/LoggingConfig.*). spdlog supplies the rotating file sink — the same
 # one liblogos already logs through, so this adds no second copy to the closure.
@@ -339,6 +350,15 @@ set(PROJECT_SOURCES
     restricted/SandboxLogging.cpp
 )
 
+# The host half of out-of-process view rendering (RFC-4). The Logos.Surface
+# item itself is added by qt_add_qml_module below; the compositor is Linux only.
+if(LOGOS_HAVE_WAYLAND_COMPOSITOR)
+    list(APPEND PROJECT_SOURCES
+        surface/SurfaceCompositor.h
+        surface/SurfaceCompositor.cpp
+    )
+endif()
+
 if(EXISTS ${GENERATED_LOGOS_SDK_CPP})
     set_source_files_properties(${GENERATED_LOGOS_SDK_CPP} PROPERTIES
         GENERATED TRUE
@@ -374,9 +394,32 @@ endif()
 # The UI shell's seven qt_add_qml_module targets live in ../src. They are STATIC
 # modules registering their types from a static initializer, so they link into
 # the main_ui plugin — the image that loads the QML — not this executable.
+#
+# The ONE QML module this executable owns: Logos.Surface (RFC-3), the type a
+# sandboxed ui_qml view uses to show the surface its own backend renders in
+# its ui-host process. It is host code and must be registered from the host
+# image, which is what makes it impossible for a module to ship its own; the
+# sandbox lists it as vetted (restricted/SharedLogosModules.h). An executable
+# backing target has no plugin — the generated type registration is a static
+# initializer in this binary, so the module exists in every engine the
+# process creates, sandboxed ones included.
+qt_add_qml_module(LogosBasecamp
+    URI Logos.Surface
+    VERSION 1.0
+    SOURCES
+        surface/LogosSurfaceItem.h
+        surface/LogosSurfaceItem.cpp
+)
+if(LOGOS_HAVE_WAYLAND_COMPOSITOR)
+    target_compile_definitions(LogosBasecamp PRIVATE LOGOS_HAVE_WAYLAND_COMPOSITOR)
+endif()
+
 target_include_directories(LogosBasecamp PRIVATE
     ${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/include
     ${GENERATED_LOGOS_SDK_DIR}
+    # qmltyperegistrar includes Logos.Surface's header by bare name
+    # (`__has_include(<LogosSurfaceItem.h>)`), so its directory must be here.
+    ${CMAKE_CURRENT_SOURCE_DIR}/surface
 )
 
 if(LOGOS_PORTABLE_BUILD)
@@ -420,6 +463,8 @@ target_link_libraries(LogosBasecamp PRIVATE
     Qt6::QuickWidgets
     Qt6::QuickControls2
     Qt6::Network
+    # The nested compositor for view_surface modules (Linux only, see above).
+    $<$<BOOL:${LOGOS_HAVE_WAYLAND_COMPOSITOR}>:Qt6::WaylandCompositor>
     # LOGOS_VIEW_MODULE_RUNTIME_LIB comes BEFORE logos_qt_host_shared for the
     # same GNU ld reason spelled out for logos_core below, and it is load-bearing
     # on Windows for exactly the same mechanism. That archive references

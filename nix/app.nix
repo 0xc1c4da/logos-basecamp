@@ -157,6 +157,9 @@ pkgs.stdenv.mkDerivation rec {
       pkgs.xorg.libXfixes
       pkgs.xorg.libxcb
       pkgs.qt6.qtwayland
+      # libwayland-server: the nested compositor (Qt6::WaylandCompositor,
+      # app/surface/) links it directly, so the dev wrapper must find it.
+      pkgs.wayland
     ]
   );
   qtPluginPath = pkgs.lib.concatStringsSep ":" ([

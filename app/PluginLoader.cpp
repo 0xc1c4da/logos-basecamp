@@ -32,8 +32,49 @@
 #include "logos_api.h"
 #include "logos_consumer.h"
 #include "restricted/QmlSandbox.h"
+#include "surface/LogosSurfaceItem.h"
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+#include "surface/SurfaceCompositor.h"
+#endif
 #include "utils/DependencyEntry.h"
 #include <ViewModuleHost.h>
+
+namespace {
+
+// A view_surface backend (RFC-5) is spawned as a GUI process pointed at the
+// host's nested compositor. Without a compositor it still runs --gui and may
+// open an ordinary window; the Logos.Surface item then reports noCompositor.
+ViewSpawnOptions spawnOptionsFor(const PluginLoadRequest& request)
+{
+    ViewSpawnOptions options;
+    if (!request.viewSurface) return options;
+    options.gui = true;
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+    if (SurfaceCompositor* compositor = SurfaceCompositor::instance();
+        compositor && compositor->isAvailable())
+        options.surfaceSocket = compositor->socketName();
+#endif
+    return options;
+}
+
+// forget() before stop(): the compositor must not read the disconnect that
+// follows as a lost surface (RFC-5 rule 4).
+void stopViewHost(ViewModuleHost* viewHost)
+{
+    if (!viewHost) return;
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+    if (SurfaceCompositor* compositor = SurfaceCompositor::existing())
+        compositor->forget(viewHost->surfaceToken());
+#endif
+    viewHost->stop();
+}
+
+} // namespace
+
+void PluginLoader::stopViewModuleHost(ViewModuleHost* viewHost)
+{
+    stopViewHost(viewHost);
+}
 
 PluginLoader::PluginLoader(LogosAPI* logosAPI,
                            CoreModuleManager* coreModuleManager,
@@ -384,7 +425,9 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
     // lose to them and capability_module would refuse with "auth token not
     // recognized".
     auto* viewHost = new ViewModuleHost(this);
-    if (!viewHost->spawn(request.name, request.mainFilePath, consumer.credential)) {
+    const ViewSpawnOptions spawnOptions = spawnOptionsFor(request);
+    if (!viewHost->spawn(request.name, request.mainFilePath, consumer.credential,
+                         spawnOptions)) {
         qWarning() << "Failed to spawn ui-host for ui_qml module" << request.name;
         delete viewHost;
         delete bridge;
@@ -393,10 +436,24 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
             QStringLiteral("Failed to spawn ui-host for ") + request.name);
         return;
     }
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+    // Before the child can commit anything: the compositor admits a toplevel
+    // only under a token it already expects from exactly this pid (RFC-4 §2).
+    if (!spawnOptions.surfaceSocket.isEmpty()) {
+        if (SurfaceCompositor* compositor = SurfaceCompositor::existing())
+            compositor->expect(request.name, viewHost->surfaceToken(), viewHost->processId());
+    }
+#endif
 
     auto onHostReady = [this, request, bridge, viewHost]() {
         bridge->setViewModuleSocket(request.name, viewHost->socketName(),
                                     viewHost->sourceName());
+        if (viewHost->isGui()) {
+            if (!viewHost->surfaceTokenConfirmed())
+                qWarning() << "ui-host for" << request.name
+                           << "did not confirm its surface token";
+            bridge->setViewModuleSurface(request.name, viewHost->surfaceToken());
+        }
         auto exitConn = std::make_shared<QMetaObject::Connection>(
             connect(viewHost, &ViewModuleHost::processExited, bridge,
                 [bridge, name = request.name](int) { bridge->notifyViewModuleCrashed(name); }));
@@ -406,7 +463,7 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
                 QObject::disconnect(*exitConn);
                 if (!ok) {
                     qWarning() << "Backend of" << request.name << "not ready:" << error;
-                    viewHost->stop();
+                    stopViewHost(viewHost);
                     viewHost->deleteLater();
                     delete bridge;
                     setLoading(request.name, false);
@@ -435,7 +492,7 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
             QObject::disconnect(*timeoutConn);
             timeout->deleteLater();
             qWarning() << "Timeout waiting for ui-host ready signal for" << request.name;
-            viewHost->stop();
+            stopViewHost(viewHost);
             viewHost->deleteLater();
             delete bridge;
             setLoading(request.name, false);
@@ -458,6 +515,10 @@ QQuickWidget* createSandboxedView(const PluginLoadRequest& request)
         QmlSandbox::configure(engine, request.installDir, request.qmlViewPath,
                               appLibDir, request.name);
         engine->setBaseUrl(QUrl::fromLocalFile(request.installDir + "/"));
+        // Which module this engine's view belongs to, for Logos.Surface: a
+        // property on the engine object, out of QML's reach, so a view can
+        // only ever ask for its own backend's surface (RFC-3).
+        LogosSurfaceItem::bindEngine(engine, request.name);
     }
     return qmlWidget;
 }
@@ -492,7 +553,7 @@ void PluginLoader::loadQmlView(const PluginLoadRequest& request,
             qWarning() << "Failed to compile ui_qml view" << request.name << ":" << errors;
             qmlWidget->deleteLater();
             delete bridge;
-            if (viewHost) { viewHost->stop(); delete viewHost; }
+            if (viewHost) { stopViewHost(viewHost); delete viewHost; }
             setLoading(request.name, false);
             emit pluginLoadFailed(request.name, errors);
         }
@@ -534,7 +595,7 @@ void PluginLoader::finishUiQmlLoad(QQuickWidget* qmlWidget,
         const auto errors = qmlWidget->errors();
         for (const QQmlError& error : errors) qWarning() << error.toString();
         qmlWidget->deleteLater();
-        if (viewHost) { viewHost->stop(); delete viewHost; }
+        if (viewHost) { stopViewHost(viewHost); delete viewHost; }
         setLoading(request.name, false);
         emit pluginLoadFailed(request.name,
             QStringLiteral("Failed to load QML view for ") + request.name);
