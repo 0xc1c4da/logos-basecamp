@@ -33,31 +33,84 @@
 #include "logos_consumer.h"
 #include "restricted/QmlSandbox.h"
 #include "surface/LogosSurfaceItem.h"
+#include "surface/SurfacePolicy.h"
+#include "surface/SurfaceTransportSelector.h"
 #ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
 #include "surface/SurfaceCompositor.h"
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+#include "surface/SurfaceChannelHost.h"
 #endif
 #include "utils/DependencyEntry.h"
 #include <ViewModuleHost.h>
 
 namespace {
 
-// A view_surface backend (RFC-5) is spawned as a GUI process pointed at the
-// host's nested compositor. Without a compositor it still runs --gui and may
-// open an ordinary window; the Logos.Surface item then reports noCompositor.
+// A view_surface backend (RFC-5) is spawned as a GUI process on the
+// SurfaceTransport the policy grants (RFC-6 §3): the host's nested
+// compositor (RFC-4) or a SurfaceHostSession of the channel host (RFC-7).
+// Denied, or with neither available, it still runs --gui and may open an
+// ordinary window; the Logos.Surface item then reports noCompositor/denied.
 ViewSpawnOptions spawnOptionsFor(const PluginLoadRequest& request)
 {
     ViewSpawnOptions options;
     if (!request.viewSurface) return options;
     options.gui = true;
+    const SurfaceGrant grant = SurfacePolicy::decide(request);
+    if (!grant.allowed) {
+        qInfo() << "view_surface for" << request.name << "not granted:" << grant.denialReason;
+        return options;
+    }
 #ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (SurfaceCompositor* compositor = SurfaceCompositor::instance();
-        compositor && compositor->isAvailable())
-        options.surfaceSocket = compositor->socketName();
+    if (grant.transport == QLatin1String("wayland")) {
+        if (SurfaceCompositor* compositor = SurfaceCompositor::instance();
+            compositor && compositor->isAvailable()) {
+            options.surfaceSocket = compositor->socketName();
+            options.surfaceTransport = QStringLiteral("wayland");
+            return options;
+        }
+    }
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+    if (grant.transport == QLatin1String("channel")
+        || options.surfaceTransport.isEmpty()) {
+        SurfaceChannelHost* host = SurfaceChannelHost::instance();
+        host->setForcedShm(grant.shmOnly);
+        const QString server = host->open(request.name);
+        if (!server.isEmpty()) {
+            options.surfaceSocket = server;
+            options.surfaceTransport = QStringLiteral("channel");
+            return options;
+        }
+        qWarning() << "could not open a surface channel for" << request.name;
+    }
 #endif
     return options;
 }
 
-// forget() before stop(): the compositor must not read the disconnect that
+// After spawn(), before the child can commit anything: the transport admits
+// a surface only under the token it expects from exactly this pid (RFC-4 §2,
+// RFC-7 §3), and the item learns which family to bind.
+void expectSurface(const PluginLoadRequest& request, ViewModuleHost* viewHost,
+                   const ViewSpawnOptions& spawnOptions)
+{
+    if (spawnOptions.surfaceTransport.isEmpty()) return;
+    SurfaceTransportSelector::record(request.name, spawnOptions.surfaceTransport);
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+    if (spawnOptions.surfaceTransport == QLatin1String("wayland")) {
+        if (SurfaceCompositor* compositor = SurfaceCompositor::existing())
+            compositor->expect(request.name, viewHost->surfaceToken(), viewHost->processId());
+    }
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+    if (spawnOptions.surfaceTransport == QLatin1String("channel")) {
+        if (SurfaceChannelHost* host = SurfaceChannelHost::existing())
+            host->expect(request.name, viewHost->surfaceToken(), viewHost->processId());
+    }
+#endif
+}
+
+// forget() before stop(): the transport must not read the disconnect that
 // follows as a lost surface (RFC-5 rule 4).
 void stopViewHost(ViewModuleHost* viewHost)
 {
@@ -66,6 +119,11 @@ void stopViewHost(ViewModuleHost* viewHost)
     if (SurfaceCompositor* compositor = SurfaceCompositor::existing())
         compositor->forget(viewHost->surfaceToken());
 #endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+    if (SurfaceChannelHost* host = SurfaceChannelHost::existing())
+        host->forget(viewHost->moduleName());
+#endif
+    SurfaceTransportSelector::forget(viewHost->moduleName());
     viewHost->stop();
 }
 
@@ -429,6 +487,10 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
     if (!viewHost->spawn(request.name, request.mainFilePath, consumer.credential,
                          spawnOptions)) {
         qWarning() << "Failed to spawn ui-host for ui_qml module" << request.name;
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+        if (SurfaceChannelHost* host = SurfaceChannelHost::existing())
+            host->forget(request.name);
+#endif
         delete viewHost;
         delete bridge;
         setLoading(request.name, false);
@@ -436,14 +498,7 @@ void PluginLoader::loadUiQmlModule(const PluginLoadRequest& request)
             QStringLiteral("Failed to spawn ui-host for ") + request.name);
         return;
     }
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    // Before the child can commit anything: the compositor admits a toplevel
-    // only under a token it already expects from exactly this pid (RFC-4 §2).
-    if (!spawnOptions.surfaceSocket.isEmpty()) {
-        if (SurfaceCompositor* compositor = SurfaceCompositor::existing())
-            compositor->expect(request.name, viewHost->surfaceToken(), viewHost->processId());
-    }
-#endif
+    expectSurface(request, viewHost, spawnOptions);
 
     auto onHostReady = [this, request, bridge, viewHost]() {
         bridge->setViewModuleSocket(request.name, viewHost->socketName(),

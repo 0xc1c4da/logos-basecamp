@@ -211,6 +211,24 @@ find_library(LOGOS_VIEW_MODULE_RUNTIME_LIB
     NO_DEFAULT_PATH
     REQUIRED)
 
+# The channel SurfaceTransport (RFC-7): the host side of the slot ring lives
+# in the runtime's LogosViewSurface shared library, which Basecamp links and
+# ui-host loads. Every OS has it (shm slots; d3d11/iosurface where native).
+# Optional only so that a runtime built before RFC-7 still links: then
+# Logos.Surface has the Wayland backend alone (Linux) or none.
+set(LOGOS_HAVE_SURFACE_CHANNEL OFF)
+find_library(LOGOS_VIEW_SURFACE_LIB
+    NAMES LogosViewSurface
+    PATHS ${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/lib ${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/bin
+    NO_DEFAULT_PATH)
+if(LOGOS_VIEW_SURFACE_LIB AND EXISTS "${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/include/logos/surface/SurfaceHostSession.h")
+    set(LOGOS_HAVE_SURFACE_CHANNEL ON)
+    set(LOGOS_VIEW_SURFACE_INCLUDE "${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/include/logos/surface")
+    message(STATUS "Using LogosViewSurface (channel transport): ${LOGOS_VIEW_SURFACE_LIB}")
+else()
+    message(STATUS "LogosViewSurface not found under ${LOGOS_VIEW_MODULE_RUNTIME_ROOT}: channel transport disabled")
+endif()
+
 # ── logos-design-system ──────────────────────────────────────────────────────
 # Logos.Theme / .Icons / .Controls come from logos-design-system as STATIC
 # qt_add_qml_module targets exposed via the Logos::DesignSystem umbrella
@@ -350,12 +368,33 @@ set(PROJECT_SOURCES
     restricted/SandboxLogging.cpp
 )
 
-# The host half of out-of-process view rendering (RFC-4). The Logos.Surface
-# item itself is added by qt_add_qml_module below; the compositor is Linux only.
+# The host half of out-of-process view rendering (RFC-4/6/7). The
+# Logos.Surface item itself is added by qt_add_qml_module below; its
+# backends, the transport selector and the policy hook are plain sources.
+# The compositor and its backend are Linux only; the channel host and its
+# backend exist wherever the runtime's LogosViewSurface library does.
+list(APPEND PROJECT_SOURCES
+    surface/SurfaceBackend.h
+    surface/SurfaceBackend.cpp
+    surface/SurfaceTransportSelector.h
+    surface/SurfaceTransportSelector.cpp
+    surface/SurfacePolicy.h
+    surface/SurfacePolicy.cpp
+)
 if(LOGOS_HAVE_WAYLAND_COMPOSITOR)
     list(APPEND PROJECT_SOURCES
         surface/SurfaceCompositor.h
         surface/SurfaceCompositor.cpp
+        surface/WaylandSurfaceBackend.h
+        surface/WaylandSurfaceBackend.cpp
+    )
+endif()
+if(LOGOS_HAVE_SURFACE_CHANNEL)
+    list(APPEND PROJECT_SOURCES
+        surface/SurfaceChannelHost.h
+        surface/SurfaceChannelHost.cpp
+        surface/ChannelSurfaceBackend.h
+        surface/ChannelSurfaceBackend.cpp
     )
 endif()
 
@@ -413,9 +452,13 @@ qt_add_qml_module(LogosBasecamp
 if(LOGOS_HAVE_WAYLAND_COMPOSITOR)
     target_compile_definitions(LogosBasecamp PRIVATE LOGOS_HAVE_WAYLAND_COMPOSITOR)
 endif()
+if(LOGOS_HAVE_SURFACE_CHANNEL)
+    target_compile_definitions(LogosBasecamp PRIVATE LOGOS_HAVE_SURFACE_CHANNEL)
+endif()
 
 target_include_directories(LogosBasecamp PRIVATE
     ${LOGOS_VIEW_MODULE_RUNTIME_ROOT}/include
+    $<$<BOOL:${LOGOS_HAVE_SURFACE_CHANNEL}>:${LOGOS_VIEW_SURFACE_INCLUDE}>
     ${GENERATED_LOGOS_SDK_DIR}
     # qmltyperegistrar includes Logos.Surface's header by bare name
     # (`__has_include(<LogosSurfaceItem.h>)`), so its directory must be here.
@@ -465,6 +508,12 @@ target_link_libraries(LogosBasecamp PRIVATE
     Qt6::Network
     # The nested compositor for view_surface modules (Linux only, see above).
     $<$<BOOL:${LOGOS_HAVE_WAYLAND_COMPOSITOR}>:Qt6::WaylandCompositor>
+    # Private headers only, for one boolean: whether the compositor's client
+    # buffer integration came up (SurfaceCompositor::gpuBuffersAvailable).
+    $<$<BOOL:${LOGOS_HAVE_WAYLAND_COMPOSITOR}>:Qt6::WaylandCompositorPrivate>
+    # The channel transport's host session (RFC-7), a shared library on
+    # every OS, so its position is not load-bearing anywhere.
+    $<$<BOOL:${LOGOS_HAVE_SURFACE_CHANNEL}>:${LOGOS_VIEW_SURFACE_LIB}>
     # LOGOS_VIEW_MODULE_RUNTIME_LIB comes BEFORE logos_qt_host_shared for the
     # same GNU ld reason spelled out for logos_core below, and it is load-bearing
     # on Windows for exactly the same mechanism. That archive references

@@ -1,19 +1,20 @@
 #include "LogosSurfaceItem.h"
 
+#include "SurfaceBackend.h"
+#include "SurfaceTransportSelector.h"
+
+#include <QEvent>
 #include <QLoggingCategory>
 #include <QQmlEngine>
 #include <QQuickWindow>
 #include <QSGSimpleRectNode>
-#include <QTimer>
 
 #ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-#include "SurfaceCompositor.h"
-#include <QWaylandBufferRef>
-#include <QWaylandOutput>
-#include <QWaylandQuickShellSurfaceItem>
-#include <QWaylandSurface>
-#include <QWaylandView>
-#include <QWaylandXdgShell>
+#include "WaylandSurfaceBackend.h"
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+#include "ChannelSurfaceBackend.h"
+#include "SurfaceChannelHost.h"
 #endif
 
 Q_LOGGING_CATEGORY(lcSurfaceItem, "basecamp.surface.item")
@@ -28,10 +29,15 @@ LogosSurfaceItem::LogosSurfaceItem(QQuickItem* parent)
     : QQuickItem(parent)
 {
     setFlag(ItemHasContents, true);
-    setAcceptedMouseButtons(Qt::NoButton);   // input goes to the shell item
+    // Input stays off until a backend that wants the item's events binds;
+    // the Wayland backend's child item takes input itself.
+    setAcceptedMouseButtons(Qt::NoButton);
 }
 
-LogosSurfaceItem::~LogosSurfaceItem() = default;
+LogosSurfaceItem::~LogosSurfaceItem()
+{
+    if (m_backend) m_backend->unbind();
+}
 
 void LogosSurfaceItem::bindEngine(QQmlEngine* engine, const QString& module)
 {
@@ -77,9 +83,9 @@ void LogosSurfaceItem::itemChange(ItemChange change, const ItemChangeData& value
     QQuickItem::itemChange(change, value);
     if (change == ItemSceneChange) {
         tryBind();
-        updateOutputGate();
+        if (m_backend) m_backend->visibilityChanged(isVisible() && window());
     } else if (change == ItemVisibleHasChanged) {
-        updateOutputGate();
+        if (m_backend) m_backend->visibilityChanged(value.boolValue && window());
     }
 }
 
@@ -87,15 +93,30 @@ void LogosSurfaceItem::geometryChange(const QRectF& newGeometry, const QRectF& o
 {
     QQuickItem::geometryChange(newGeometry, oldGeometry);
     if (newGeometry.size() == oldGeometry.size()) return;
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (m_shellItem) m_shellItem->setSize(newGeometry.size());
-#endif
-    sendConfigure();
+    if (m_backend) m_backend->geometryChanged(newGeometry.size());
     update();
 }
 
 QSGNode* LogosSurfaceItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*)
 {
+    if (m_backend && m_backend->paintsItself()) {
+        // The backend's node, or the placeholder while it has nothing yet.
+        // The backend owns whatever node it is handed (it reuses or deletes
+        // it); the placeholder is ours and is never handed over.
+        const bool oldIsPlaceholder = oldNode && oldNode == m_placeholderNode;
+        QSGNode* node = m_backend->updatePaintNode(oldIsPlaceholder ? nullptr : oldNode);
+        if (node) {
+            if (oldIsPlaceholder) delete oldNode;
+            m_placeholderNode = nullptr;
+            return node;
+        }
+        auto* rect = oldIsPlaceholder ? static_cast<QSGSimpleRectNode*>(oldNode)
+                                      : new QSGSimpleRectNode;
+        m_placeholderNode = rect;
+        rect->setRect(boundingRect());
+        rect->setColor(m_placeholderColor);
+        return rect;
+    }
     // Once the client's buffer is on screen the shell item paints; the
     // placeholder behind it would only cost fill rate.
     if (m_ready) {
@@ -107,6 +128,38 @@ QSGNode* LogosSurfaceItem::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData
     node->setRect(boundingRect());
     node->setColor(m_placeholderColor);
     return node;
+}
+
+bool LogosSurfaceItem::event(QEvent* event)
+{
+    if (m_backend && m_backend->wantsItemInput()) {
+        switch (event->type()) {
+        case QEvent::MouseMove:
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::HoverEnter:
+        case QEvent::HoverMove:
+        case QEvent::HoverLeave:
+        case QEvent::Wheel:
+        case QEvent::TouchBegin:
+        case QEvent::TouchUpdate:
+        case QEvent::TouchEnd:
+        case QEvent::TouchCancel:
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease:
+        case QEvent::FocusIn:
+        case QEvent::FocusOut:
+            if (event->type() == QEvent::MouseButtonPress) forceActiveFocus(Qt::MouseFocusReason);
+            m_backend->forwardEvent(event);
+            if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut)
+                return QQuickItem::event(event);
+            return true;
+        default:
+            break;
+        }
+    }
+    return QQuickItem::event(event);
 }
 
 void LogosSurfaceItem::setReady(bool ready)
@@ -133,20 +186,22 @@ void LogosSurfaceItem::fail(const QString& code)
     emit error(code);
 }
 
+SurfaceBackend* LogosSurfaceItem::makeBackend(const QString& family)
+{
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+    if (family == QLatin1String("wayland")) return new WaylandSurfaceBackend(this);
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+    if (family == QLatin1String("channel")) return new ChannelSurfaceBackend(this);
+#endif
+    return nullptr;
+}
+
 void LogosSurfaceItem::tryBind()
 {
-    if (m_failed || m_waiting) return;
+    if (m_failed || m_backend) return;
     if (!isComponentComplete() || !window() || m_module.isEmpty()) return;
-#ifndef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    fail(QStringLiteral("noCompositor"));
-#else
-    if (m_shellItem) return;
 
-    SurfaceCompositor* compositor = SurfaceCompositor::existing();
-    if (!compositor || !compositor->isAvailable()) {
-        fail(QStringLiteral("noCompositor"));
-        return;
-    }
     // A view may only show its own backend. The sandbox recorded on the engine
     // which module this view belongs to; nothing the QML can set changes it.
     const QString own = boundModule(qmlEngine(this));
@@ -154,155 +209,56 @@ void LogosSurfaceItem::tryBind()
         fail(QStringLiteral("tokenMismatch"));
         return;
     }
-    const QString token = compositor->tokenFor(m_module);
-    if (token.isEmpty()) {
-        fail(QStringLiteral("notGuiModule"));
+
+    // The family the module was spawned with (PluginLoader recorded it). A
+    // module nobody recorded falls back to whatever this host has running, so
+    // a test that only drives the compositor or only the channel host works:
+    // a channel session for the module if one exists, else a compositor.
+    QString family = SurfaceTransportSelector::familyFor(m_module);
+    if (family.isEmpty()) {
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+        if (SurfaceChannelHost* host = SurfaceChannelHost::existing(); host && host->sessionFor(m_module))
+            family = QStringLiteral("channel");
+#endif
+#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
+        if (family.isEmpty() && SurfaceTransportSelector::waylandAvailable()) family = QStringLiteral("wayland");
+#endif
+#ifdef LOGOS_HAVE_SURFACE_CHANNEL
+        if (family.isEmpty()) family = QStringLiteral("channel");
+#endif
+    }
+    SurfaceBackend* backend = makeBackend(family);
+    if (!backend) {
+        fail(family.isEmpty() ? QStringLiteral("denied") : QStringLiteral("noCompositor"));
         return;
     }
 
-    m_compositor = compositor;
-    m_token = token;
-    compositor->ensureOutput(window());
-    connect(compositor, &SurfaceCompositor::surfaceLost, this, [this](const QString& t) {
-        if (t == m_token) detach(QStringLiteral("clientExited"));
-    });
-    connect(compositor, &SurfaceCompositor::surfaceBound, this, [this](const QString& t) {
-        if (t == m_token && !m_shellItem) {
-            m_waiting = false;
-            attach();
-        }
-    });
-    if (compositor->boundSurface(token))
-        attach();
-    else
-        m_waiting = true;
-#endif
-}
-
-void LogosSurfaceItem::attach()
-{
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (!m_compositor || m_shellItem) return;
-    QWaylandXdgSurface* xdg = m_compositor->boundSurface(m_token);
-    QWaylandXdgToplevel* toplevel = m_compositor->boundToplevel(m_token);
-    if (!xdg || !toplevel || !xdg->surface()) return;
-
-    m_xdgSurface = xdg;
-    m_toplevel = toplevel;
-
-    // The output must exist before the shell item meets its surface; Qt
-    // asserts outputFor(window) when it connects the two.
-    m_compositor->ensureOutput(window());
-
-    m_shellItem = new QWaylandQuickShellSurfaceItem(this);
-    m_shellItem->setSize(size());
-    m_shellItem->setInputEventsEnabled(true);
-    m_shellItem->setTouchEventsEnabled(true);
-    m_shellItem->setFocusOnClick(true);
-    m_shellItem->setShellSurface(xdg);
-
+    QString code;
+    if (!backend->bind(m_module, &code)) {
+        delete backend;
+        fail(code);
+        return;
+    }
+    m_backend = backend;
     m_viewId = QStringLiteral("%1/%2/%3").arg(m_module, m_session).arg(s_nextViewSerial++);
     emit viewIdChanged();
 
-    QWaylandSurface* surface = xdg->surface();
-    auto onContent = [this, surface] {
-        if (!m_shellItem || !surface->hasContent()) return;
-        const QWaylandBufferRef buffer = m_shellItem->view()->currentBuffer();
-        if (buffer.hasBuffer())
-            setTransport(buffer.isSharedMemory() ? QStringLiteral("wayland-shm")
-                                                 : QStringLiteral("wayland-dmabuf"));
-        setReady(true);
-    };
-    connect(surface, &QWaylandSurface::hasContentChanged, this, onContent);
-    connect(surface, &QWaylandSurface::redraw, this, onContent);
-
-    sendConfigure();
-    updateOutputGate();
-    onContent();
-
-    if (!m_enterTimer) {
-        m_enterTimer = new QTimer(this);
-        m_enterTimer->setInterval(100);
-        connect(m_enterTimer, &QTimer::timeout, this, &LogosSurfaceItem::ensureEntered);
+    connect(backend, &SurfaceBackend::readyChanged, this, &LogosSurfaceItem::setReady);
+    connect(backend, &SurfaceBackend::transportChanged, this, &LogosSurfaceItem::setTransport);
+    connect(backend, &SurfaceBackend::lost, this, [this](const QString& code) {
+        qCWarning(lcSurfaceItem) << m_viewId << code;
+        emit error(code);
+    });
+    if (backend->wantsItemInput()) {
+        setAcceptedMouseButtons(Qt::AllButtons);
+        setAcceptHoverEvents(true);
+        setAcceptTouchEvents(true);
+        setFlag(ItemIsFocusScope, false);
+        setFocus(true);
     }
-    m_enterAttempts = 0;
-    m_enterTimer->start();
-    qCInfo(lcSurfaceItem) << "attached" << m_viewId;
-#endif
-}
-
-void LogosSurfaceItem::ensureEntered()
-{
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    // Qt sends wl_output.enter from the first frame-callback round after the
-    // surface has content, and marks it done even when the client has not yet
-    // bound that output (the per-window output is created after the client
-    // connected, so this is the normal case here). A client that misses the
-    // enter keeps rendering at the headless output's scale. Until its buffer
-    // scale matches the window output, re-attach the view to the output —
-    // which resets Qt's entered flag — and ask for a host frame to resend it.
-    if (!m_shellItem || !m_xdgSurface || !m_compositor || !isVisible() || !window()) {
-        if (m_enterTimer) m_enterTimer->stop();
-        return;
-    }
-    QWaylandOutput* output = m_compositor->outputFor(window());
-    const bool matched = output && m_xdgSurface->surface()->bufferScale() == output->scaleFactor();
-    if (matched || ++m_enterAttempts > 30) {
-        m_enterTimer->stop();
-        if (!matched)
-            qCWarning(lcSurfaceItem) << m_viewId << "client never adopted the output scale";
-        return;
-    }
-    if (output) {
-        m_shellItem->setOutput(nullptr);
-        m_shellItem->setOutput(output);
-        m_shellItem->update();
-    }
-#endif
-}
-
-void LogosSurfaceItem::detach(const QString& errorCode)
-{
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (!m_shellItem) return;
-    if (m_enterTimer) m_enterTimer->stop();
-    // Deleting the item drops its view; setShellSurface(nullptr) on an
-    // already-destroyed shell surface only draws a Qt warning.
-    m_shellItem->setOutput(nullptr);
-    m_shellItem->setVisible(false);
-    m_shellItem->deleteLater();
-    m_shellItem = nullptr;
-    m_toplevel.clear();
-    m_xdgSurface.clear();
-    setReady(false);
-    setTransport(QStringLiteral("none"));
-    m_waiting = true;   // a re-bound surface under the same token re-attaches
-    qCWarning(lcSurfaceItem) << m_viewId << errorCode;
-    emit error(errorCode);
-#else
-    Q_UNUSED(errorCode);
-#endif
-}
-
-void LogosSurfaceItem::sendConfigure()
-{
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (!m_toplevel) return;
-    const QSize logical(qRound(width()), qRound(height()));
-    if (logical.isEmpty()) return;
-    // Logical pixels; the client multiplies by the output scale itself.
-    m_toplevel->sendConfigure(logical, QList<int>{});
-#endif
-}
-
-void LogosSurfaceItem::updateOutputGate()
-{
-#ifdef LOGOS_HAVE_WAYLAND_COMPOSITOR
-    if (!m_shellItem || !m_compositor) return;
-    // An invisible item leaves its output: the surface then gets no frame
-    // callbacks and the client idles (RFC-5 rule 1). The hidden-tab case is
-    // already covered by the tab's window not rendering at all.
-    QWaylandOutput* output = isVisible() && window() ? m_compositor->outputFor(window()) : nullptr;
-    m_shellItem->setOutput(output);
-#endif
+    setReady(backend->isReady());
+    setTransport(backend->transport());
+    backend->geometryChanged(size());
+    backend->visibilityChanged(isVisible() && window());
+    qCInfo(lcSurfaceItem) << "bound" << m_viewId << "via" << family;
 }
