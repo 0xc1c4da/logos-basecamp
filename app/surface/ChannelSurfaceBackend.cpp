@@ -51,6 +51,9 @@ bool ChannelSurfaceBackend::bind(const QString& module, QString* errorCode)
     m_session = session;
 
     connect(session, &SurfaceHostSession::frameReady, this, [this] {
+        if (!m_pacing.clock.isValid()) m_pacing.clock.start();
+        m_pacing.lastArrivalNs = m_pacing.clock.nsecsElapsed();
+        ++m_pacing.arrived;
         if (m_item) m_item->update();
     });
     connect(session, &SurfaceHostSession::transportChanged, this, [this] {
@@ -95,9 +98,25 @@ void ChannelSurfaceBackend::attachWindow(QQuickWindow* window)
     // Render thread → GUI thread: the frame that painted the successor has
     // been issued, so the slot it replaced can go back to the view (RFC-7 §5).
     connect(window, &QQuickWindow::afterRendering, this, [this] {
+        ++m_pacing.swapped;
+        reportPacing();
         if (m_session) m_session->frameSwapped();
     }, Qt::QueuedConnection);
     connect(window, &QQuickWindow::screenChanged, this, [this] { configure(); });
+}
+
+void ChannelSurfaceBackend::reportPacing()
+{
+    if (!lcSurfaceChannel().isDebugEnabled() || !m_pacing.clock.isValid()) return;
+    const qint64 now = m_pacing.clock.nsecsElapsed();
+    if (now - m_pacing.lastReportNs < 1000000000LL) return;
+    const double secs = double(now - m_pacing.lastReportNs) / 1e9;
+    qCDebug(lcSurfaceChannel, "pacing %s: %.0f frames/s arrived, %.0f/s shown, %.0f/s host swaps, arrival->paint %.1f ms",
+            qPrintable(m_module), m_pacing.arrived / secs, m_pacing.shown / secs, m_pacing.swapped / secs,
+            m_pacing.shown ? double(m_pacing.arrivalWaitNs) / m_pacing.shown / 1e6 : 0.0);
+    m_pacing.lastReportNs = now;
+    m_pacing.arrived = m_pacing.shown = m_pacing.swapped = 0;
+    m_pacing.arrivalWaitNs = 0;
 }
 
 void ChannelSurfaceBackend::unbind()
@@ -160,6 +179,10 @@ QSGNode* ChannelSurfaceBackend::updatePaintNode(QSGNode* oldNode)
         node->setFiltering(QSGTexture::Linear);
     }
     if (node->slot != slot || fresh) {
+        if (fresh && m_pacing.clock.isValid()) {
+            ++m_pacing.shown;
+            m_pacing.arrivalWaitNs += m_pacing.clock.nsecsElapsed() - m_pacing.lastArrivalNs;
+        }
         QSGTexture* texture = slot->createTexture(window);
         if (!texture) {
             delete node;
