@@ -19,6 +19,19 @@
 #include <QWaylandXdgShell>
 #include <QtMath>
 
+#include <wayland-server-core.h>
+
+// Whether Qt's client buffer integration (wl_drm / linux-dmabuf) initialised
+// is not public API: QWaylandCompositor only logs a warning when it did not.
+// The private header is the one truthful source; without it (another Qt
+// build) the answer is "unknown", reported as unavailable.
+#if __has_include(<QtWaylandCompositor/private/qwaylandcompositor_p.h>)
+#include <QtWaylandCompositor/private/qwaylandcompositor_p.h>
+#define LOGOS_HAVE_QWAYLANDCOMPOSITOR_PRIVATE 1
+#endif
+
+#include <cstring>
+
 Q_LOGGING_CATEGORY(lcSurface, "basecamp.surface")
 
 namespace {
@@ -26,6 +39,18 @@ namespace {
 constexpr const char* kAppIdPrefix = "logos-view-";
 
 SurfaceCompositor* g_instance = nullptr;
+
+// RFC-4 rev 2 H2. wl_display_set_global_filter governs both what wl_registry
+// advertises and what wl_registry.bind accepts, so a hidden global cannot be
+// bound by guessing its name.
+bool globalFilter(const wl_client*, const wl_global* global, void* data)
+{
+    auto* self = static_cast<SurfaceCompositor*>(data);
+    const wl_interface* iface = wl_global_get_interface(global);
+    const bool allowed = iface && SurfaceCompositor::isGlobalAllowed(iface->name, self->gpuBuffersAllowed());
+    if (!allowed && iface) qCDebug(lcSurface) << "hiding global" << iface->name;
+    return allowed;
+}
 
 QString randomHex(int bytes)
 {
@@ -106,12 +131,57 @@ SurfaceCompositor::SurfaceCompositor(QObject* parent)
     connect(m_compositor, &QWaylandCompositor::surfaceRequested,
             this, &SurfaceCompositor::onSurfaceRequested);
 
+    m_gpuBuffers = qEnvironmentVariableIntValue("LOGOS_SURFACE_GPU_BUFFERS") == 1;
+
     m_compositor->create();
     m_available = m_compositor->isCreated();
-    if (m_available)
-        qCInfo(lcSurface) << "nested compositor on" << m_compositor->socketName();
-    else
+    if (!m_available) {
         qCWarning(lcSurface) << "nested compositor failed to start";
+        return;
+    }
+    // H2: installed before any client can be dispatched (the event loop has
+    // not run since the socket appeared), so it applies to every connection.
+    wl_display_set_global_filter(m_compositor->display(), globalFilter, this);
+    const char* buffers = !m_gpuBuffers ? "(shm only)"
+                          : gpuBuffersAvailable() ? "(GPU buffers allowed and available)"
+                          : "(GPU buffers allowed but no client buffer integration: shm only)";
+    qCInfo(lcSurface) << "nested compositor on" << m_compositor->socketName() << buffers;
+}
+
+bool SurfaceCompositor::gpuBuffersRequested()
+{
+    return qEnvironmentVariableIntValue("LOGOS_SURFACE_GPU_BUFFERS") == 1;
+}
+
+bool SurfaceCompositor::gpuBuffersAvailable() const
+{
+    if (!m_available || !m_gpuBuffers || !m_compositor) return false;
+#ifdef LOGOS_HAVE_QWAYLANDCOMPOSITOR_PRIVATE
+    return !QWaylandCompositorPrivate::get(m_compositor)->clientBufferIntegrations().isEmpty();
+#else
+    return false;
+#endif
+}
+
+bool SurfaceCompositor::isGlobalAllowed(const char* name, bool gpuBuffers)
+{
+    if (!name) return false;
+    static const char* const kAlways[] = {
+        "wl_compositor", "wl_subcompositor", "wl_shm", "wl_seat", "wl_output", "xdg_wm_base",
+        // H5, when the compositor instantiates them.
+        "wp_viewporter", "wp_fractional_scale_manager_v1",
+    };
+    for (const char* n : kAlways)
+        if (std::strcmp(n, name) == 0) return true;
+    static const char* const kGpu[] = {
+        "zwp_linux_dmabuf_v1", "wl_drm", "qt_hardware_integration",
+    };
+    if (gpuBuffers)
+        for (const char* n : kGpu)
+            if (std::strcmp(n, name) == 0) return true;
+    // wl_data_device_manager, text input, everything else: not bridged,
+    // not offered.
+    return false;
 }
 
 SurfaceCompositor::~SurfaceCompositor()
@@ -202,10 +272,29 @@ void SurfaceCompositor::onSurfaceRequested(QWaylandClient* client, uint, int)
 {
     if (!client || m_refusedClients.contains(client)) return;
     const qint64 pid = client->processId();
+    bool expected = false;
     for (auto it = m_expected.cbegin(); it != m_expected.cend(); ++it)
-        if (it->pid == pid) return;
-    qCWarning(lcSurface) << "refusing connection from unexpected pid" << pid;
-    refuse(client, QString());
+        if (it->pid == pid) { expected = true; break; }
+    if (!expected) {
+        qCWarning(lcSurface) << "refusing connection from unexpected pid" << pid;
+        refuse(client, QString());
+        return;
+    }
+    // H3: the earliest the host sees a connection is its first surface
+    // request; cap its receive buffer once, here.
+    if (!m_cappedClients.contains(client)) {
+        m_cappedClients.insert(client);
+        connect(client, &QObject::destroyed, this,
+                [this, client] { m_cappedClients.remove(client); });
+        wl_client_set_max_buffer_size(client->client(), kMaxClientBufferBytes);
+    }
+}
+
+bool SurfaceCompositor::bufferWithinBounds(const QSize& size)
+{
+    if (size.isEmpty()) return true;
+    if (size.width() > kMaxBufferSide || size.height() > kMaxBufferSide) return false;
+    return qint64(size.width()) * qint64(size.height()) * 4 <= kMaxBufferBytes;
 }
 
 void SurfaceCompositor::onToplevelCreated(QWaylandXdgToplevel* toplevel,
@@ -264,8 +353,26 @@ void SurfaceCompositor::tryAdmit(QWaylandXdgToplevel* toplevel,
     connect(toplevel, &QObject::destroyed, this, [this, token] { onBoundGone(token); });
     connect(surface, &QWaylandSurface::surfaceDestroyed, this,
             [this, token] { onBoundGone(token); });
+    // H3: every committed buffer is measured before anything uploads it.
+    connect(surface, &QWaylandSurface::bufferSizeChanged, this,
+            [this, token, surface] { checkBufferBounds(token, surface); });
     qCInfo(lcSurface) << "bound surface for" << it->module << "pid" << pid;
     emit surfaceBound(token);
+    checkBufferBounds(token, surface);
+}
+
+void SurfaceCompositor::checkBufferBounds(const QString& token, QWaylandSurface* surface)
+{
+    if (!m_bound.contains(token) || !surface) return;
+    const QSize size = surface->bufferSize();
+    if (bufferWithinBounds(size)) return;
+    qCWarning(lcSurface) << "buffer" << size << "from" << m_expected.value(token).module
+                         << "exceeds the bound; closing the client";
+    // Drop the binding first so the item detaches (its view stops sampling
+    // the surface) before the deferred close destroys the toplevel.
+    m_bound.remove(token);
+    refuse(surface->client(), QStringLiteral("oversize"));
+    if (m_expected.contains(token)) emit surfaceLost(token);
 }
 
 void SurfaceCompositor::refuse(QWaylandClient* client, const QString& appId)

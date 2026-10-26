@@ -22,6 +22,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QSize>
 #include <QString>
 
 class QQuickWindow;
@@ -54,6 +55,18 @@ public:
     bool isAvailable() const;
     QString socketName() const;
 
+    // Whether a client of this compositor can get GPU buffers: the host
+    // allowed them (LOGOS_SURFACE_GPU_BUFFERS=1, H2) AND Qt's client buffer
+    // integration came up (the host's EGL exports EGL_WL_bind_wayland_display,
+    // so wl_drm / zwp_linux_dmabuf_v1 exist to bind). Without this a client
+    // sees wl_shm only, and Mesa then gives it no GPU context at all — the
+    // module renders in software (llvmpipe). That makes this the condition
+    // for choosing the Wayland transport by default (RFC-6 §3): the one
+    // thing it does better than `channel` is zero-copy GPU buffers, and
+    // without them it is strictly worse.
+    bool gpuBuffersAvailable() const;
+    static bool gpuBuffersRequested();
+
     // Admission table. expect() before the client can connect — i.e. right
     // after ViewModuleHost::spawn() returns, with the token it minted — and
     // forget() before ViewModuleHost::stop(), so the disconnect that follows
@@ -79,6 +92,22 @@ public:
     QWaylandOutput* outputFor(QQuickWindow* window) const;
 
     QWaylandCompositor* compositor() const { return m_compositor; }
+
+    // RFC-4 rev 2 H2: which globals a client may see and bind. The protocol
+    // one Qt toplevel needs is always offered; the GPU buffer path
+    // (zwp_linux_dmabuf_v1, wl_drm, qt_hardware_integration) only when the
+    // host allows it. A property of this instance, not of the environment
+    // the child could influence; initialised from LOGOS_SURFACE_GPU_BUFFERS=1.
+    void setGpuBuffersAllowed(bool allowed) { m_gpuBuffers = allowed; }
+    bool gpuBuffersAllowed() const { return m_gpuBuffers; }
+    static bool isGlobalAllowed(const char* interfaceName, bool gpuBuffers);
+
+    // RFC-4 rev 2 H3: the largest buffer a client may commit; a larger one
+    // closes the client before Qt uploads it.
+    static constexpr int kMaxBufferSide = 8192;
+    static constexpr qint64 kMaxBufferBytes = qint64(256) * 1024 * 1024;
+    // Per-connection receive buffer cap (wl_client_set_max_buffer_size).
+    static constexpr size_t kMaxClientBufferBytes = size_t(1) << 20;
 
     // Test seam: the number of clients/toplevels refused so far.
     int refusedCount() const { return m_refused; }
@@ -110,13 +139,18 @@ private:
     void tryAdmit(QWaylandXdgToplevel* toplevel, QWaylandXdgSurface* xdgSurface, bool final);
     void refuse(QWaylandClient* client, const QString& appId);
     void onBoundGone(const QString& token);
+    void checkBufferBounds(const QString& token, QWaylandSurface* surface);
+    static bool bufferWithinBounds(const QSize& size);
     int scaleFor(QQuickWindow* window) const;
 
     QWaylandCompositor* m_compositor = nullptr;
     QWaylandXdgShell* m_xdgShell = nullptr;
     QWaylandOutput* m_headlessOutput = nullptr;
     bool m_available = false;
+    bool m_gpuBuffers = false;
     int m_refused = 0;
+    // Clients whose receive buffer has been capped (H3).
+    QSet<QWaylandClient*> m_cappedClients;
 
     QHash<QString, Expected> m_expected;   // token -> expectation
     QHash<QString, QString> m_tokenByModule;
